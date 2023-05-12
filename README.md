@@ -1,1 +1,3 @@
 # sqllogictest
+
+fixed SQLINTEGER->SQLLEN
