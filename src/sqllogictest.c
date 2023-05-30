@@ -70,12 +70,13 @@ static void usage(const char *argv0){
     "  --connection STR       The connection string\n"
     "  --engine DBENGINE      The engine name (ex: SQLite, ODBC3)\n"
     "  --halt                 Stop when first error is seen\n"
-    "  --ht NUM               Check results by hash if numbe of lines > NUM\n"
+    "  --ht NUM               Check results by hash if number of lines > NUM\n"
     "  --odbc STR             Shorthand for \"--engine ODBC3 --connection STR\"\n"
     "  --parameters TXT       Extra parameters to the connection string\n"
     "  --trace                Enable tracing of SQL to standard output\n"
     "  --verify               Use \"verify MODE\"\n"
     "  --failures DIR         Record failures into directory DIR; there will be subdirs with failed script and results\n"
+    "  --diffcontext N        Diff context size (diff -U N) when computing diff of results of failed query\n"
   );
   exit(1);
 }
@@ -378,6 +379,7 @@ char failureReturnedRowsFilename[MAX_FAILURE_PATH_LEN];   /* file to write retur
 char failureExpectedRowsFilename[MAX_FAILURE_PATH_LEN];   /* file to write expected rows. */
 char failureValuesDiffFilename[MAX_FAILURE_PATH_LEN];     /* file to write diff betwenn files with values. */
 char failureRowsDiffFilename[MAX_FAILURE_PATH_LEN];       /* file to write diff between files with rows. */
+char diffCommandLine[MAX_FAILURE_PATH_LEN*4];             /* file to write diff between files with rows. */
 
 
 static FILE* createResultsFile(char*buf, const char* failureDir, const char* zScriptFile, int line, char* name){
@@ -416,6 +418,7 @@ int main(int argc, char **argv){
   char* failureDir = 0;                /* where to put reports about failures */
   int canWriteRows = 0;                /* does it make sense to write expected/returned rows and their differences? */
   const char *zParam = 0;              /* Argument to -parameters */
+  int diffContextSize = 3;             /* Context size for diff. Should be positive. */
 
   /* Add calls to the registration procedures for new database engine
   ** interfaces here
@@ -466,6 +469,12 @@ int main(int argc, char **argv){
     }else if( strncmp(z, "-failures", n)==0 ) {
       recordFailures = 1;
       failureDir = argv[++i];
+    }else if( strncmp(z, "-diffcontext", n)==0 ) {
+      diffContextSize = atoi(argv[++i]);
+      if( diffContextSize < 1 ){
+        fprintf(stderr, "diff context size (diff -U %d) is non-positive; default to 1\n", diffContextSize);
+        diffContextSize = 1;
+      }
     }else if( zScriptFile==0 ){
       zScriptFile = z;
       zScriptFilename = strrchr(zScriptFile, '/');
@@ -819,7 +828,7 @@ int main(int argc, char **argv){
                   fprintf(expectedValues, "%s\n", expected);
 		}
 		if( expectedRows ){
-                  fprintf(expectedRows, "%s", returned);
+                  fprintf(expectedRows, "%s", expected);
 		  if( (k % nColumn) == (nColumn-1) ){
                     fprintf(expectedRows, "\n");
 		  } else {
@@ -829,28 +838,28 @@ int main(int argc, char **argv){
                 free(head);
 		head = next;
               }
-              while( head ){
-                index_p next = head->next;
-                free(head);
-                head = next;
-	      }
-	      checkFClose(returnedValues);
-	      checkFClose(returnedRows);
-	      checkFClose(expectedValues);
-	      checkFClose(expectedRows);
-	    } else {
-              while( head ){
-                index_p next = head->next;
-                free(head);
-                head = next;
+              checkFClose(returnedValues);
+              checkFClose(returnedRows);
+              checkFClose(expectedValues);
+              checkFClose(expectedRows);
+              /* XXX: filenames in diff can be very long */
+              failureReportFilename(failureValuesDiffFilename, failureDir, zScriptFilename, sScript.nLine, "values.diff");
+              /* we always have values files */
+              snprintf(diffCommandLine, sizeof(diffCommandLine), "diff -U %d %s %s > %s", diffContextSize, failureReturnedValuesFilename,
+                              failureExpectedValuesFilename, failureValuesDiffFilename);
+	      system(diffCommandLine);
+              if( canWriteRows ){
+	        failureReportFilename(failureRowsDiffFilename, failureDir, zScriptFilename, sScript.nLine, "rows.diff");
+                snprintf(diffCommandLine, sizeof(diffCommandLine), "diff -U %d %s %s > %s", diffContextSize, failureReturnedRowsFilename,
+                                failureExpectedRowsFilename, failureRowsDiffFilename);
+                system(diffCommandLine);
 	      }
             }
-	  } else {
-            while( head ){
-              index_p next = head->next;
-	      free(head);
-	      head = next;
-	    }
+	  }
+          while( head ){
+            index_p next = head->next;
+	    free(head);
+	    head = next;
 	  }
         }else{
           if( strcmp(sScript.zLine, zHash)!=0 ){
