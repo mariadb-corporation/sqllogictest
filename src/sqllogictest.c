@@ -32,6 +32,9 @@
 #define stricmp strcasecmp
 #endif
 #include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include "slt_sqlite.c"
 #include "slt_odbc3.c"
@@ -72,6 +75,7 @@ static void usage(const char *argv0){
     "  --parameters TXT       Extra parameters to the connection string\n"
     "  --trace                Enable tracing of SQL to standard output\n"
     "  --verify               Use \"verify MODE\"\n"
+    "  --failures DIR         Record failures into directory DIR; there will be subdirs with failed script and results\n"
   );
   exit(1);
 }
@@ -300,7 +304,85 @@ static int checkValue(const char *zKey, const char *zHash){
   return 0;
 }
 
+/* we have to keep indices of results; we'll do that in a linked list. */
+typedef struct index_s index_t, *index_p;
+struct index_s { char* line; index_p next; };
 
+/* push index into a new head; this makes reverse order of indices */
+static index_p pushIndex(index_p head, char*line) {
+  index_p cur = malloc(sizeof(*cur));
+  if (!cur) {
+    fprintf(stderr, "unable to allocate list head\n");
+    exit(1);
+  }
+  cur->line = line;
+  cur->next = head;
+  return cur;
+}
+
+/* reverse list so that order of lines is correct */
+static index_p reverseList(index_p head) {
+  index_p tail = NULL;
+  while (head) {
+    index_p next = head->next;
+    head->next = tail;
+    tail = head;
+    head = next;
+  }
+  return tail;
+}
+
+/* check for NULL and fclose if not */
+static void checkFClose(FILE* f){
+  if( f ){ fclose(f); }
+}
+
+/* max path len for failure report filenames.
+** we will cut after that so user may get incorrect results if path given is too long.
+**/
+#define	MAX_FAILURE_PATH_LEN (10000)
+static char failureScriptFilename[MAX_FAILURE_PATH_LEN];
+
+/* concatenate a failure report filename in some buffer long enough to hold MAX_FAILURE_PATH_LEN chars */
+static char* failureReportFilename(char* buf, const char* failureDir, const char* zScriptFile, int line, char* name){
+  snprintf(buf, MAX_FAILURE_PATH_LEN, "%s/%s/%d/%s", failureDir, zScriptFile, line, name);
+  return buf;
+}
+
+/* write an offending script to a file. attempts to create failure directory on a first call.
+** This func should be called first when reporting failure.
+**/
+static char execBuf[MAX_FAILURE_PATH_LEN * 4];
+static void writeFailedScript(const char* failureDir, const char* zScriptFile, int line, char* zScript){
+  FILE* scriptFile;
+  char* thisReportDir = failureReportFilename(failureScriptFilename, failureDir, zScriptFile, line, "");
+  int status;
+  snprintf(execBuf, sizeof(execBuf), "mkdir -p %s", thisReportDir); /* XXX: I have lost any self-repospect. */
+  status = system(execBuf);
+  if (status) {
+    fprintf(stderr, "failed to create failure reports directory '%s'\n", thisReportDir);
+  }
+  scriptFile = fopen(failureReportFilename(failureScriptFilename, failureDir, zScriptFile, line, "sql"), "w");
+  fprintf(stderr, "%s:%d: writing offending script into %s\n", zScriptFile, line, failureScriptFilename);
+  if( scriptFile ){
+    fprintf(scriptFile, "%s\n", zScript);
+    fclose(scriptFile);
+  } else {
+    fprintf(stderr, "%s:%d: error writing offending script\n", zScriptFile, line);
+  }
+}
+
+char failureReturnedValuesFilename[MAX_FAILURE_PATH_LEN]; /* file to write returned values. */
+char failureExpectedValuesFilename[MAX_FAILURE_PATH_LEN]; /* file to write expected values. */
+char failureReturnedRowsFilename[MAX_FAILURE_PATH_LEN];   /* file to write returned rows. */
+char failureExpectedRowsFilename[MAX_FAILURE_PATH_LEN];   /* file to write expected rows. */
+char failureValuesDiffFilename[MAX_FAILURE_PATH_LEN];     /* file to write diff betwenn files with values. */
+char failureRowsDiffFilename[MAX_FAILURE_PATH_LEN];       /* file to write diff between files with rows. */
+
+
+static FILE* createResultsFile(char*buf, const char* failureDir, const char* zScriptFile, int line, char* name){
+  return fopen(failureReportFilename(buf, failureDir, zScriptFile, line, name), "w");
+}
 /*
 ** This is the main routine.  This routine runs first.  It processes
 ** command-line arguments then runs the test.
@@ -310,6 +392,7 @@ int main(int argc, char **argv){
   int haltOnError = 0;                 /* Stop on first error if true */
   int enableTrace = 0;                 /* Trace SQL statements if true */
   const char *zScriptFile = 0;         /* Input script filename */
+  const char *zScriptFilename = 0;     /* input script filename, stripped from path */
   const char *zDbEngine = "SQLite";    /* Name of database engine */
   const char *zConnection = 0;         /* Connection string on DB engine */
   const DbEngine *pEngine = 0;         /* Pointer to DbEngine object */
@@ -329,6 +412,9 @@ int main(int argc, char **argv){
   char zHash[100];                     /* Storage space for hash results */
   int hashThreshold = DEFAULT_HASH_THRESHOLD;  /* Threshold for hashing res */
   int bHt = 0;                         /* True if -ht command-line option */
+  int recordFailures = 0;              /* turn on recording of failed scripts and results expected/returned */
+  char* failureDir = 0;                /* where to put reports about failures */
+  int canWriteRows = 0;                /* does it make sense to write expected/returned rows and their differences? */
   const char *zParam = 0;              /* Argument to -parameters */
 
   /* Add calls to the registration procedures for new database engine
@@ -377,8 +463,17 @@ int main(int argc, char **argv){
       enableTrace = 1;
     }else if( strncmp(z, "-verify",n)==0 ){
       verifyMode = 1;
+    }else if( strncmp(z, "-failures", n)==0 ) {
+      recordFailures = 1;
+      failureDir = argv[++i];
     }else if( zScriptFile==0 ){
       zScriptFile = z;
+      zScriptFilename = strrchr(zScriptFile, '/');
+      if( zScriptFilename ){
+        ++zScriptFilename;
+      } else {
+        zScriptFilename = zScriptFile;
+      }
     }else{
       fprintf(stderr, "%s: unknown argument: %s\n", argv[0], argv[i]);
       usage(argv[0]);
@@ -404,6 +499,9 @@ int main(int argc, char **argv){
     for(i=0; i<nEngine; i++) fprintf(stdout, " %s", apEngine[i]->zName);
     fprintf(stdout, "\n");
     exit(1);
+  }
+  if( recordFailures && strlen(failureDir) + strlen(zScriptFile) > MAX_FAILURE_PATH_LEN - 100 ){
+    fprintf(stderr, "failure report path is too long, resulting filenames may be cut in unexpected way.\nPlease inspect program output carefullly for possible problems.");
   }
 
   /*
@@ -616,13 +714,19 @@ int main(int argc, char **argv){
       if( rc ){
         fprintf(stderr, "%s:%d: query failed\n",
                 zScriptFile, sScript.startLine);
+	fprintf(stderr, "-- query --------------\n%s\n----------------------\n", zScript);
         pEngine->xFreeResults(pConn, azResult, nResult);
         nErr++;
+	if( recordFailures ){
+	  writeFailedScript(failureDir, zScriptFilename, sScript.nLine, zScript);
+	}
         continue;
       }
 
+      canWriteRows = 1;
       /* Do any required sorting of query results */
       if( sScript.azToken[2][0]==0 || strcmp(sScript.azToken[2],"nosort")==0 ){
+        nColumn = (int)strlen(sScript.azToken[1]);
         /* Do no sorting */
       }else if( strcmp(sScript.azToken[2],"rowsort")==0 ){
         /* Row-oriented sorting */
@@ -632,6 +736,7 @@ int main(int argc, char **argv){
       }else if( strcmp(sScript.azToken[2],"valuesort")==0 ){
         /* Sort all values independently */
         nColumn = 1;
+	canWriteRows = 0;
         qsort(azResult, nResult, sizeof(azResult[0]), rowCompare);
       }else{
         fprintf(stderr, "%s:%d: unknown sort method: '%s'\n",
@@ -666,24 +771,96 @@ int main(int argc, char **argv){
         /* In verify mode, first skip over the ---- line if we are still
         ** pointing at it. */
         if( strcmp(sScript.zLine, "----")==0 ) nextLine(&sScript);
-
+        index_p head = NULL;
         /* Compare subsequent lines of the script against the results
         ** from the query.  Report an error if any differences are found.
         */
         if( hashThreshold==0 || nResult<=hashThreshold ){
+          int errorFound = 0;
           for(i=0; i<nResult && sScript.zLine[0]; nextLine(&sScript), i++){
-            if( strcmp(sScript.zLine, azResult[i])!=0 ){
-              fprintf(stdout,"%s:%d: wrong result\n", zScriptFile,
-                      sScript.nLine);
-              nErr++;
-              break;
+            head = pushIndex(head, sScript.zLine);
+            if(!errorFound && strcmp(sScript.zLine, azResult[i])!=0 ){
+              errorFound = 1;
             }
           }
+	  if (errorFound) {
+            fprintf(stdout,"%s:%d: wrong result\n", zScriptFile,
+                    sScript.nLine);
+            nErr++;
+	    if( recordFailures ){
+              int k;
+              writeFailedScript(failureDir, zScriptFilename, sScript.nLine, zScript);
+	      /* any of these files can be NULL. We will not write to file that is not open. */
+              FILE* returnedValues = createResultsFile(failureReturnedValuesFilename, failureDir, zScriptFilename, sScript.nLine, "returned.values");
+	      FILE* expectedValues = createResultsFile(failureExpectedValuesFilename, failureDir, zScriptFilename, sScript.nLine, "expected.values");
+              FILE* returnedRows = NULL;
+              FILE* expectedRows = NULL;
+	      if( canWriteRows ){
+                returnedRows = createResultsFile(failureReturnedRowsFilename, failureDir, zScriptFilename, sScript.nLine, "returned.rows");
+                expectedRows = createResultsFile(failureExpectedRowsFilename, failureDir, zScriptFilename, sScript.nLine, "expected.rows");
+	      }
+	      head = reverseList(head);
+              for(k=0; k<nResult; k++){
+                char *returned = azResult[k];
+                char *expected = head ? head->line : "<<unexpected-end-of-expected-results>>";
+		index_p next = head ? head->next : NULL;
+                if( returnedValues ){
+                  fprintf(returnedValues, "%s\n", returned);
+                }
+                if( returnedRows ){
+                  fprintf(returnedRows, "%s", returned);
+		  if( (k % nColumn) == (nColumn-1) ){
+                    fprintf(returnedRows, "\n");
+		  } else {
+                    fprintf(returnedRows, "\t");
+                  }
+                }
+		if( expectedValues ){
+                  fprintf(expectedValues, "%s\n", expected);
+		}
+		if( expectedRows ){
+                  fprintf(expectedRows, "%s", returned);
+		  if( (k % nColumn) == (nColumn-1) ){
+                    fprintf(expectedRows, "\n");
+		  } else {
+                    fprintf(expectedRows, "\t");
+                  }
+		}
+                free(head);
+		head = next;
+              }
+              while( head ){
+                index_p next = head->next;
+                free(head);
+                head = next;
+	      }
+	      checkFClose(returnedValues);
+	      checkFClose(returnedRows);
+	      checkFClose(expectedValues);
+	      checkFClose(expectedRows);
+	    } else {
+              while( head ){
+                index_p next = head->next;
+                free(head);
+                head = next;
+	      }
+            }
+	  } else {
+            while( head ){
+              index_p next = head->next;
+	      free(head);
+	      head = next;
+	    }
+	  }
         }else{
           if( strcmp(sScript.zLine, zHash)!=0 ){
             fprintf(stderr, "%s:%d: wrong result hash\n",
                     zScriptFile, sScript.nLine);
             nErr++;
+	    if( recordFailures ){
+              writeFailedScript(failureDir, zScriptFile, sScript.nLine, zScript);
+              fprintf(stderr, "we will not write results and theiri differents in hash checking mode.\nUse --ht 0 to disable hashing and get the results\n");
+            }
           }
         }
       }else{
@@ -766,5 +943,5 @@ int main(int argc, char **argv){
   
   }
   free(zScript);
-  return nErr; 
+  return nErr ? 1 : 0; 
 }
