@@ -41,6 +41,8 @@
 #include <sql.h>
 #include <sqlext.h>
 
+#include <stdint.h>
+
 
 #define SLT_DSN   "sqllogictest"
 #define SLT_DB    "slt"
@@ -592,10 +594,10 @@ static int ODBC3Query(
               break;
             }
             case 'I': {
-              long int li = 0L;
+              int64_t li = 0L;
               SQLGetData(stmt, 
                          i, 
-                         SQL_C_SLONG,
+                         SQL_C_SBIGINT,
                          &li, 
                          sizeof(li), 
                          &indicator);
