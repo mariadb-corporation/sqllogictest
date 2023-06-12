@@ -811,8 +811,6 @@ int main(int argc, char **argv){
 	      head = reverseList(head);
               for(k=0; k<nResult; k++){
                 char *returned = azResult[k];
-                char *expected = head ? head->line : "<<unexpected-end-of-expected-results>>";
-		index_p next = head ? head->next : NULL;
                 if( returnedValues ){
                   fprintf(returnedValues, "%s\n", returned);
                 }
@@ -824,6 +822,10 @@ int main(int argc, char **argv){
                     fprintf(returnedRows, "\t");
                   }
                 }
+              }
+	      for( k=0; head; k++ ){
+                char *expected = head->line;
+		index_p next = head->next;
 		if( expectedValues ){
                   fprintf(expectedValues, "%s\n", expected);
 		}
@@ -837,7 +839,7 @@ int main(int argc, char **argv){
 		}
                 free(head);
 		head = next;
-              }
+	      }
               checkFClose(returnedValues);
               checkFClose(returnedRows);
               checkFClose(expectedValues);
